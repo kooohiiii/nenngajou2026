@@ -1,0 +1,863 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>馬インベーダー</title>
+  <style>
+    html, body { margin:0; height:100%; background:#000; overflow:hidden; }
+    canvas { display:block; width:100vw; height:100vh; touch-action:none; }
+
+    #restartBtn{
+      position: fixed;
+      left: 50%;
+      top: 60%;
+      transform: translate(-50%, -50%);
+      padding: 14px 18px;
+      font-size: 16px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.75);
+      background: rgba(0,0,0,0.78);
+      color: #fff;
+      display: none;
+      z-index: 10;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+    #restartBtn:active { transform: translate(-50%, -50%) scale(0.98); }
+  </style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<button id="restartBtn">やりなおす</button>
+
+<script>
+(() => {
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const restartBtn = document.getElementById("restartBtn");
+
+  // ===== Utils =====
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const now = () => performance.now();
+
+  // ===== Resize =====
+  function resize() {
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    canvas.width  = Math.floor(window.innerWidth * dpr);
+    canvas.height = Math.floor(window.innerHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS pixels
+  }
+  window.addEventListener("resize", () => {
+    resize();
+    applyScreenAwareTuning();
+    reflowForStage();
+  }, { passive: true });
+  resize();
+
+  // ===== Assets =====
+  const stages = [
+    { name: "STAGE 1", src: "horse1.png" },
+    { name: "STAGE 2", src: "horse2.png" },
+    { name: "BOSS",    src: "phoenix.png" },
+  ];
+
+  function loadImage(src) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve({ ok: true, img });
+      img.onerror = () => resolve({ ok: false, img: null });
+      img.src = src;
+    });
+  }
+
+  const stageImages = Array(stages.length).fill(null);
+  (async () => {
+    for (let i = 0; i < stages.length; i++) {
+      stageImages[i] = await loadImage(stages[i].src);
+    }
+  })();
+
+  function getStageImage() {
+    const rec = stageImages[state.stage];
+    return rec && rec.ok ? rec.img : null;
+  }
+
+  // ===== State =====
+  const state = {
+    running: true,
+    won: false,
+    lost: false,
+    score: 0,
+    stage: 0, // 0..2
+  };
+
+  // ===== Player =====
+  const player = {
+    w: 52, h: 20,
+    x: 0, y: 0,
+    speed: 500,
+    cooldownMs: 125,
+    lastShotAt: -1e9,
+  };
+
+  // ===== Bullets =====
+  const bullets = [];      // player bullets
+  const enemyBullets = []; // enemy bullets
+  let bulletSpeed = 780;        // 少し遅め
+  let enemyBulletSpeed = 320;
+
+  // ===== Explosions =====
+  const explosions = [];
+  function spawnExplosion(x, y, power = 1) {
+    const ttl = 0.42;
+    const parts = [];
+    const n = Math.floor(20 * power);
+    for (let i = 0; i < n; i++) {
+      const a = (Math.PI * 2) * (i / n) + (Math.random() - 0.5) * 0.25;
+      const sp = (90 + Math.random() * 240) * power;
+      parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 0, ttl: 0.20 + Math.random() * 0.35 });
+    }
+    explosions.push({ x, y, life: 0, ttl, parts });
+  }
+
+  // ===== Enemies =====
+  const enemies = []; // {x,y,w,h,alive,hp,maxHp,isBoss,col,row,frozen}
+
+  // Formation (stage 1-2)
+  const inv = {
+    cols: 6,
+    rows: 4,
+    w: 64,
+    h: 48,
+    gapX: 18,
+    gapY: 16,
+    offsetX: 0,
+    offsetY: 92,
+    dir: 1,
+    speed: 52,
+  };
+
+  // Boss (stage 3)
+  const boss = { count: 2, hp: 30 };
+  let bossPhaseTime = 0;
+
+  // ===== Input (Keyboard) =====
+  const keys = { left:false, right:false, shoot:false };
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "ArrowLeft" || e.code === "KeyA") keys.left = true;
+    if (e.code === "ArrowRight" || e.code === "KeyD") keys.right = true;
+    if (e.code === "Space" || e.code === "KeyZ") keys.shoot = true;
+    if (e.code === "Enter") { if (!state.running) handleEndAction(); }
+  });
+  window.addEventListener("keyup", (e) => {
+    if (e.code === "ArrowLeft" || e.code === "KeyA") keys.left = false;
+    if (e.code === "ArrowRight" || e.code === "KeyD") keys.right = false;
+    if (e.code === "Space" || e.code === "KeyZ") keys.shoot = false;
+  });
+
+  // ===== Input (Touch) =====
+  let touchMode = false;
+  let touchLeft = false, touchRight = false, touchShoot = false;
+  function resetTouch(){ touchLeft = touchRight = touchShoot = false; }
+
+  function handleTouch(clientX, clientY, isDown) {
+    touchMode = true;
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    const x = clamp(clientX, 0, w);
+    const y = clamp(clientY, 0, h);
+
+    resetTouch();
+    if (!isDown) return;
+
+    const moveZoneTop = h * 0.72; // 下28%
+    const inMoveZone = y >= moveZoneTop;
+
+    if (inMoveZone) {
+      if (x < w * 0.5) touchLeft = true;
+      else touchRight = true;
+    } else {
+      touchShoot = true;
+    }
+  }
+
+  canvas.addEventListener("pointerdown", (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    handleTouch(e.clientX, e.clientY, true);
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    handleTouch(e.clientX, e.clientY, e.buttons === 1);
+  });
+  canvas.addEventListener("pointerup", () => resetTouch());
+
+  // ===== End / Button =====
+  function showRestartButton(show) { restartBtn.style.display = show ? "block" : "none"; }
+
+  // クリア時：次へ。最終クリア後：ステージ1へ周回。
+  // 死亡時：そのステージを最初から。
+  function handleEndAction() {
+    if (state.won) {
+      if (state.stage < stages.length - 1) state.stage++;
+      else state.stage = 0;
+    }
+    restartStage();
+  }
+
+  restartBtn.addEventListener("click", handleEndAction, { passive: true });
+  canvas.addEventListener("click", () => { if (!state.running) handleEndAction(); });
+
+  // ===== Screen-aware tuning =====
+  let baseShootChance = 0.14;
+  function applyScreenAwareTuning() {
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+    const minDim = Math.min(W, H);
+
+    inv.w = Math.floor(clamp(W * 0.13, 54, 92));
+    inv.h = Math.floor(inv.w * 0.78);
+    inv.gapX = Math.floor(clamp(inv.w * 0.35, 14, 28));
+    inv.gapY = Math.floor(clamp(inv.h * 0.32, 10, 24));
+
+    player.w = Math.floor(clamp(W * 0.15, 48, 74));
+    player.h = Math.floor(clamp(player.w * 0.40, 18, 28));
+    player.speed = clamp(W * 1.15, 360, 760);
+
+    bulletSpeed = clamp(H * 1.18, 620, 920);       // 自機弾：少し遅め
+    enemyBulletSpeed = clamp(H * 0.60, 260, 520);
+
+    inv.speed = clamp(W * 0.10, 30, 72);
+
+    baseShootChance = clamp(0.10 + (minDim / 900) * 0.08, 0.10, 0.20);
+    player.cooldownMs = touchMode ? 115 : 125;
+  }
+
+  // ===== Spawn =====
+  function resetPlayer() {
+    player.x = (window.innerWidth - player.w) / 2;
+    player.y = window.innerHeight - player.h - 54;
+    player.lastShotAt = -1e9;
+  }
+
+  function spawnFormation() {
+    enemies.length = 0;
+    inv.dir = 1;
+
+    const totalWidth = inv.cols * inv.w + (inv.cols - 1) * inv.gapX;
+    inv.offsetX = (window.innerWidth - totalWidth) / 2;
+    inv.offsetY = Math.floor(clamp(window.innerHeight * 0.14, 70, 130));
+
+    for (let r = 0; r < inv.rows; r++) {
+      for (let c = 0; c < inv.cols; c++) {
+        // STAGE2：上段左5体を固定＆HP2
+        const frozen = (state.stage === 1 && r === 0 && c < 5);
+        const hp = frozen ? 2 : 1;
+
+        enemies.push({
+          x: inv.offsetX + c * (inv.w + inv.gapX),
+          y: inv.offsetY + r * (inv.h + inv.gapY),
+          w: inv.w, h: inv.h,
+          alive: true,
+          hp, maxHp: hp,
+          isBoss: false,
+          col: c, row: r,
+          frozen
+        });
+      }
+    }
+  }
+
+  function spawnBosses() {
+    enemies.length = 0;
+
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+
+    const bw = Math.floor(clamp(W * 0.20, 90, 160));
+    const bh = Math.floor(bw * 0.78);
+
+    const y = Math.floor(clamp(H * 0.18, 90, 170));
+    const x1 = Math.floor(W * 0.33 - bw / 2);
+    const x2 = Math.floor(W * 0.67 - bw / 2);
+
+    for (let i = 0; i < boss.count; i++) {
+      enemies.push({
+        x: i === 0 ? x1 : x2,
+        y,
+        w: bw, h: bh,
+        alive: true,
+        hp: boss.hp,
+        maxHp: boss.hp,
+        isBoss: true,
+        col: i, row: 0,
+        frozen: false
+      });
+    }
+
+    inv.dir = 1;
+    bossPhaseTime = 0;
+  }
+
+  function reflowForStage() {
+    if (state.stage < 2) {
+      const saved = enemies.map(e => ({ alive: e.alive, hp: e.hp }));
+      spawnFormation();
+      for (let i = 0; i < enemies.length; i++) {
+        if (saved[i]) { enemies[i].alive = saved[i].alive; enemies[i].hp = saved[i].hp; }
+      }
+    } else {
+      const savedHp = enemies.map(e => e.hp);
+      spawnBosses();
+      for (let i = 0; i < enemies.length; i++) enemies[i].hp = savedHp[i] ?? boss.hp;
+    }
+  }
+
+  function restartStage() {
+    applyScreenAwareTuning();
+
+    state.running = true;
+    state.won = false;
+    state.lost = false;
+
+    bullets.length = 0;
+    enemyBullets.length = 0;
+    explosions.length = 0;
+
+    showRestartButton(false);
+    resetTouch();
+    resetPlayer();
+
+    if (state.stage < 2) spawnFormation();
+    else spawnBosses();
+  }
+
+  // ===== Shooting =====
+  function shootPlayer(tms) {
+    if (tms - player.lastShotAt < player.cooldownMs) return;
+    player.lastShotAt = tms;
+    bullets.push({ x: player.x + player.w / 2 - 2, y: player.y - 10, w: 4, h: 10, vx: 0, vy: -bulletSpeed });
+  }
+
+  function shootEnemy(from, options = {}) {
+    enemyBullets.push({
+      x: from.x + from.w / 2 - 2,
+      y: from.y + from.h + 2,
+      w: 4, h: 10,
+      vx: options.vx || 0,
+      vy: enemyBulletSpeed,
+      type: options.type || "normal",
+      age: 0,
+      splitAt: options.splitAt ?? 0.28,
+      splitDone: false,
+      pattern: options.pattern || null
+    });
+  }
+
+  function shootEnemyDouble(from) {
+    shootEnemy(from, { type: "normal" });
+    enemyBullets.push({
+      x: from.x + from.w / 2 - 2,
+      y: from.y + from.h + 2,
+      w: 4, h: 10,
+      vx: 0,
+      vy: enemyBulletSpeed,
+      type: "delayed",
+      age: -0.12,
+      splitAt: 0,
+      splitDone: true,
+      pattern: null
+    });
+  }
+
+  // Boss split patterns:
+  // 1: LR(2), 2: LR2(4), 3: LRC(3)
+  function shootBossSplit(from, pattern, extraVx = 0) {
+    shootEnemy(from, { type: "split", splitAt: 0.24, vx: extraVx, pattern });
+  }
+
+  // ===== Collision =====
+  function aabb(a, b) {
+    return a.x < b.x + b.w &&
+           a.x + a.w > b.x &&
+           a.y < b.y + b.h &&
+           a.y + a.h > b.y;
+  }
+
+  // ===== Update / Draw =====
+  let last = now();
+
+  function step() {
+    const t = now();
+    const dt = Math.min(0.033, (t - last) / 1000);
+    last = t;
+
+    if (state.running) update(dt, t);
+    draw();
+    requestAnimationFrame(step);
+  }
+
+  function update(dt, tms) {
+    applyScreenAwareTuning();
+
+    const left  = keys.left  || touchLeft;
+    const right = keys.right || touchRight;
+    const shoot = keys.shoot || touchShoot;
+
+    // Player move
+    let vx = 0;
+    if (left) vx -= player.speed;
+    if (right) vx += player.speed;
+    player.x = clamp(player.x + vx * dt, 10, window.innerWidth - player.w - 10);
+
+    // Shoot
+    if (shoot) shootPlayer(tms);
+
+    // Move player bullets
+    for (const b of bullets) {
+      b.x += (b.vx || 0) * dt;
+      b.y += b.vy * dt;
+    }
+
+    // Enemy bullets update
+    for (let i = enemyBullets.length - 1; i >= 0; i--) {
+      const b = enemyBullets[i];
+      b.age += dt;
+
+      if (b.type === "delayed") {
+        if (b.age < 0) continue;
+        b.type = "normal";
+      }
+
+      b.x += (b.vx || 0) * dt;
+      b.y += b.vy * dt;
+
+      // Boss split
+      if (b.type === "split" && !b.splitDone && b.age >= b.splitAt) {
+        b.splitDone = true;
+
+        const pattern = b.pattern || 1;
+        const base = clamp(window.innerWidth * 0.22, 170, 360);
+        const slow = base * 0.55;
+
+        const spawnChild = (vxChild) => {
+          enemyBullets.push({ x: b.x, y: b.y, w: 4, h: 10, vx: vxChild, vy: b.vy, type: "normal", age: 0, splitAt: 0, splitDone: true, pattern: null });
+        };
+
+        if (pattern === 1) {
+          spawnChild(-base); spawnChild(+base);
+        } else if (pattern === 2) {
+          spawnChild(-slow); spawnChild(-base);
+          spawnChild(+slow); spawnChild(+base);
+        } else {
+          spawnChild(-base); spawnChild(0); spawnChild(+base);
+        }
+
+        enemyBullets.splice(i, 1);
+        continue;
+      }
+
+      if (b.y > window.innerHeight + 80 || b.x < -80 || b.x > window.innerWidth + 80) enemyBullets.splice(i, 1);
+    }
+
+    // Cleanup player bullets
+    for (let i = bullets.length - 1; i >= 0; i--) {
+      const b = bullets[i];
+      if (b.y + b.h < -60 || b.x < -60 || b.x > window.innerWidth + 60) bullets.splice(i, 1);
+    }
+
+    // Explosions update
+    for (let i = explosions.length - 1; i >= 0; i--) {
+      const ex = explosions[i];
+      ex.life += dt;
+      for (const p of ex.parts) {
+        p.life += dt;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.vx *= (1 - 2.8 * dt);
+        p.vy *= (1 - 2.8 * dt);
+      }
+      if (ex.life >= ex.ttl) explosions.splice(i, 1);
+    }
+
+    const alive = enemies.filter(e => e.alive);
+
+    // Win
+    if (alive.length === 0) {
+      state.running = false;
+      state.won = true;
+      state.lost = false;
+      showRestartButton(true);
+      return;
+    }
+
+    // Stage behaviors
+    if (state.stage < 2) {
+      updateFormation(dt, alive);
+      updateFormationShooting(dt, alive);
+    } else {
+      updateBossFight(dt, alive);
+      updateBossShooting(dt, alive);
+    }
+
+    // Player bullets vs enemies (damage)
+    for (let bi = bullets.length - 1; bi >= 0; bi--) {
+      const b = bullets[bi];
+      let hit = null;
+      for (const e of enemies) {
+        if (!e.alive) continue;
+        if (aabb(b, e)) { hit = e; break; }
+      }
+      if (hit) {
+        bullets.splice(bi, 1);
+        hit.hp -= 1;
+        spawnExplosion(hit.x + hit.w/2, hit.y + hit.h/2, hit.isBoss ? 0.9 : 0.8);
+
+        if (hit.hp <= 0) {
+          hit.alive = false;
+          spawnExplosion(hit.x + hit.w/2, hit.y + hit.h/2, hit.isBoss ? 1.5 : 1.1);
+        }
+      }
+    }
+
+    // Enemy bullets vs player
+    for (let bi = enemyBullets.length - 1; bi >= 0; bi--) {
+      const b = enemyBullets[bi];
+      if (aabb(b, player)) {
+        enemyBullets.splice(bi, 1);
+        state.running = false;
+        state.lost = true;
+        state.won = false;
+        showRestartButton(true);
+        spawnExplosion(player.x + player.w/2, player.y + player.h/2, 1.6);
+        break;
+      }
+    }
+
+    // Tap shoot is momentary
+    touchShoot = false;
+  }
+
+  // ===== Stage 1-2: Movement (NO approaching) =====
+  function updateFormation(dt, aliveInv) {
+    // STAGE2：中央列を速めに動かす（スマホで動きが無い問題対策）
+    const midA = Math.floor((inv.cols - 1) / 2); // 6 cols => 2
+    const midB = Math.ceil((inv.cols - 1) / 2);  // 6 cols => 3
+    const centerCols = (state.stage === 1) ? new Set([midA, midB]) : null;
+
+    // movers = alive and not frozen
+    const movers = aliveInv.filter(e => !e.frozen);
+    if (movers.length === 0) return;
+
+    // 壁判定は「動くやつ全体」で見る
+    let minX = Infinity, maxX = -Infinity;
+    for (const e of movers) {
+      minX = Math.min(minX, e.x);
+      maxX = Math.max(maxX, e.x + e.w);
+    }
+
+    const remainRatio = aliveInv.length / (inv.cols * inv.rows);
+    const stageBoost = (state.stage === 0) ? 1.00 : 1.10;
+    const thinBoost = 1 + (1 - remainRatio) * 0.9;
+
+    // 基本速度
+    const baseVx = inv.speed * stageBoost * thinBoost * inv.dir;
+
+    // 中央列だけ“割と早め”
+    const centerBoost = (state.stage === 1) ? 1.75 : 1.0;
+
+    // 先に「中央列が速い」ことも含めた壁到達を予測して反転
+    // ※最速（中央列）の速度で判定すると挙動が安定
+    const fastest = baseVx * ((state.stage === 1) ? centerBoost : 1);
+    const nextMinX = minX + fastest * dt;
+    const nextMaxX = maxX + fastest * dt;
+
+    if (nextMinX < 10 || nextMaxX > window.innerWidth - 10) {
+      inv.dir *= -1; // 近づかないので、向きだけ反転
+      return;
+    }
+
+    // 実際に移動
+    for (const e of movers) {
+      const mult = (state.stage === 1 && centerCols.has(e.col)) ? centerBoost : 1.0;
+      e.x += baseVx * mult * dt;
+    }
+  }
+
+  // ===== Stage 1-2: Shooting =====
+  function updateFormationShooting(dt, aliveInv) {
+    const remainRatio = aliveInv.length / (inv.cols * inv.rows);
+    const intensity = 1 + (1 - remainRatio) * 0.7;
+
+    // STAGE1: 少し多め
+    // STAGE2: 以前より少しだけ早く（ただし多すぎない）
+    const stageChance =
+      state.stage === 0 ? baseShootChance * 1.90 :
+                          baseShootChance * 1.05; // ← 0.75→1.05 に上げた
+
+    const shootPerSec = stageChance * intensity;
+
+    if (Math.random() < shootPerSec * dt) {
+      const col = Math.floor(Math.random() * inv.cols);
+      let shooter = null;
+      for (let r = inv.rows - 1; r >= 0; r--) {
+        const cand = enemies.find(e => e.alive && !e.isBoss && e.col === col && e.row === r);
+        if (cand) { shooter = cand; break; }
+      }
+      if (shooter) {
+        if (state.stage === 0) shootEnemy(shooter);
+        else shootEnemyDouble(shooter); // stage2 keeps double-shot
+      }
+    }
+  }
+
+  // ===== Stage 3: Boss movement (NO approaching) =====
+  function updateBossFight(dt, aliveBosses) {
+    bossPhaseTime += dt;
+
+    let minX = Infinity, maxX = -Infinity;
+    for (const b of aliveBosses) {
+      minX = Math.min(minX, b.x);
+      maxX = Math.max(maxX, b.x + b.w);
+    }
+
+    const hpSum = aliveBosses.reduce((s,b)=>s+b.hp,0);
+    const maxSum = aliveBosses.reduce((s,b)=>s+b.maxHp,0);
+    const hpRatio = maxSum > 0 ? (hpSum / maxSum) : 0;
+
+    const anger = 1 + (1 - hpRatio) * 0.9;
+    const vxBoss = inv.speed * 0.95 * anger * inv.dir;
+
+    const nextMinX = minX + vxBoss * dt;
+    const nextMaxX = maxX + vxBoss * dt;
+
+    if (nextMinX < 10 || nextMaxX > window.innerWidth - 10) {
+      inv.dir *= -1;
+    } else {
+      for (const b of aliveBosses) b.x += vxBoss * dt;
+    }
+
+    for (let i = 0; i < aliveBosses.length; i++) {
+      const b = aliveBosses[i];
+      b.y += Math.sin(bossPhaseTime * 1.5 + i * 2.2) * 6 * dt;
+    }
+  }
+
+  // ===== Stage 3: Boss shooting (harder) =====
+  function updateBossShooting(dt, aliveBosses) {
+    const hpSum = aliveBosses.reduce((s,b)=>s+b.hp,0);
+    const maxSum = aliveBosses.reduce((s,b)=>s+b.maxHp,0);
+    const hpRatio = maxSum > 0 ? (hpSum / maxSum) : 0;
+
+    const anger = 1 + (1 - hpRatio) * 1.25;
+
+    const shootPerSec = baseShootChance * 3.25 * anger;
+
+    if (Math.random() < shootPerSec * dt) {
+      const b = aliveBosses[Math.floor(Math.random() * aliveBosses.length)];
+      if (!b) return;
+
+      let pattern = 1;
+      if (hpRatio >= 0.666) pattern = 1;
+      else if (hpRatio >= 0.333) pattern = (Math.random() < 0.5) ? 1 : 2;
+      else pattern = (Math.random() < 0.55) ? 2 : 3;
+
+      shootBossSplit(b, pattern);
+
+      const extraChance =
+        (hpRatio >= 0.666) ? 0.22 :
+        (hpRatio >= 0.333) ? 0.35 :
+                             0.48;
+
+      if (Math.random() < extraChance) {
+        const drift = (Math.random() < 0.5 ? -1 : 1) * clamp(window.innerWidth * 0.07, 50, 120);
+        const extraPattern = (hpRatio < 0.333 && Math.random() < 0.55) ? 3 : pattern;
+        shootBossSplit(b, extraPattern, drift);
+      }
+
+      if (hpRatio < 0.333 && Math.random() < 0.18) {
+        shootBossSplit(b, 3, 0);
+      }
+    }
+  }
+
+  // ===== Draw helpers =====
+  function drawExplosion(ex) {
+    const t = ex.life / ex.ttl;
+    ctx.globalAlpha = 0.35 * (1 - t);
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(ex.x, ex.y, 10 + t * 32, 0, Math.PI * 2);
+    ctx.stroke();
+
+    for (const p of ex.parts) {
+      const pt = p.life / p.ttl;
+      if (pt >= 1) continue;
+      ctx.globalAlpha = 0.95 * (1 - pt);
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(p.x, p.y, 2, 2);
+    }
+
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = 1;
+  }
+
+  function drawBossHpBars() {
+    const bosses = enemies.filter(e => e.alive && e.isBoss);
+    if (bosses.length === 0) return;
+
+    const W = window.innerWidth;
+    const top = 64;
+
+    const totalWidth = Math.floor(clamp(W * 0.70, 260, 520));
+    const barH = 10;
+    const gap = 10;
+
+    for (let i = 0; i < bosses.length; i++) {
+      const b = bosses[i];
+      const x = Math.floor((W - totalWidth) / 2);
+      const y = top + i * (barH + gap);
+
+      ctx.globalAlpha = 0.9;
+      ctx.strokeStyle = "#fff";
+      ctx.strokeRect(x, y, totalWidth, barH);
+
+      const ratio = clamp(b.hp / b.maxHp, 0, 1);
+      ctx.globalAlpha = 0.85;
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(x, y, Math.floor(totalWidth * ratio), barH);
+
+      ctx.globalAlpha = 0.75;
+      ctx.fillStyle = "#fff";
+      ctx.font = "12px sans-serif";
+      ctx.textAlign = "left";
+      ctx.fillText(`PHOENIX ${i+1}  HP ${b.hp}/${b.maxHp}`, x, y - 4);
+    }
+    ctx.globalAlpha = 1;
+    ctx.textAlign = "left";
+  }
+
+  function drawFrozenHpHint(e) {
+    if (!e.frozen || !e.alive) return;
+    ctx.globalAlpha = 0.75;
+    ctx.fillStyle = "#fff";
+    ctx.font = "12px sans-serif";
+    ctx.textAlign = "center";
+    const text = (e.hp === 2) ? "II" : "I";
+    ctx.fillText(text, e.x + e.w/2, e.y - 4);
+    ctx.globalAlpha = 1;
+    ctx.textAlign = "left";
+  }
+
+  function draw() {
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+
+    ctx.clearRect(0, 0, W, H);
+
+    // BG
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+
+    // Stars
+    ctx.globalAlpha = 0.18;
+    ctx.fillStyle = "#fff";
+    for (let i = 0; i < 46; i++) {
+      const x = (i * 97) % W;
+      const y = (i * 173) % H;
+      ctx.fillRect(x, y, 1, 1);
+    }
+    ctx.globalAlpha = 1;
+
+    // HUD
+    ctx.fillStyle = "#fff";
+    ctx.font = "16px sans-serif";
+    ctx.fillText(`${stages[state.stage].name}`, 12, 24);
+
+    ctx.globalAlpha = 0.75;
+    ctx.font = "12px sans-serif";
+    if (touchMode) ctx.fillText(`下の左右：移動 / 上をタップ：発射`, 12, H - 12);
+    else ctx.fillText(`←→/A D 移動  SPACE/Z 発射  ENTER 次/やりなおし`, 12, H - 12);
+    ctx.globalAlpha = 1;
+
+    if (state.stage === 2) drawBossHpBars();
+
+    // Player
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(player.x, player.y, player.w, player.h);
+    ctx.fillRect(player.x + player.w/2 - 6, player.y - 7, 12, 7);
+
+    // Bullets
+    ctx.fillStyle = "#fff";
+    for (const b of bullets) ctx.fillRect(b.x, b.y, b.w, b.h);
+
+    ctx.globalAlpha = 0.9;
+    for (const b of enemyBullets) ctx.fillRect(b.x, b.y, b.w, b.h);
+    ctx.globalAlpha = 1;
+
+    // Enemies
+    const img = getStageImage();
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      if (img) ctx.drawImage(img, e.x, e.y, e.w, e.h);
+      else {
+        ctx.strokeStyle = "#fff";
+        ctx.strokeRect(e.x, e.y, e.w, e.h);
+      }
+      drawFrozenHpHint(e);
+    }
+
+    // Explosions
+    for (const ex of explosions) drawExplosion(ex);
+
+    // Touch overlay
+    if (touchMode && state.running) {
+      ctx.globalAlpha = 0.16;
+      ctx.strokeStyle = "#fff";
+      ctx.beginPath();
+      ctx.moveTo(W/2, H*0.72); ctx.lineTo(W/2, H);
+      ctx.moveTo(0, H*0.72); ctx.lineTo(W, H*0.72);
+      ctx.stroke();
+
+      ctx.globalAlpha = 0.22;
+      ctx.fillStyle = "#fff";
+      ctx.font = "18px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("◀︎", W*0.25, H*0.87);
+      ctx.fillText("▶︎", W*0.75, H*0.87);
+      ctx.textAlign = "left";
+      ctx.globalAlpha = 1;
+    }
+
+    // End overlay
+    if (!state.running) {
+      ctx.fillStyle = "rgba(0,0,0,0.65)";
+      ctx.fillRect(0, 0, W, H);
+
+      ctx.fillStyle = "#fff";
+      ctx.textAlign = "center";
+      ctx.font = "28px sans-serif";
+      const msg = state.won ? "CLEAR!" : "GAME OVER";
+      ctx.fillText(msg, W/2, H/2 - 44);
+
+      ctx.font = "16px sans-serif";
+      if (state.won) {
+        const label = (state.stage < stages.length - 1) ? "つぎのステージへ" : "最初からもう一回";
+        ctx.fillText(label, W/2, H/2 - 14);
+        restartBtn.textContent = (state.stage < stages.length - 1) ? "つぎへ" : "もう一回";
+      } else {
+        ctx.fillText("やりなおす？", W/2, H/2 - 14);
+        restartBtn.textContent = "やりなおす";
+      }
+      ctx.textAlign = "left";
+    }
+  }
+
+  // ===== Start =====
+  applyScreenAwareTuning();
+  restartStage();
+  requestAnimationFrame(step);
+})();
+</script>
+</body>
+</html>
