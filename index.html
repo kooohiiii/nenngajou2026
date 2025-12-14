@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>年賀インベーダー</title>
+  <style>
+    html, body { margin:0; height:100%; background:#000; overflow:hidden; }
+    canvas { display:block; width:100vw; height:100vh; touch-action:none; }
+  </style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<script>
+(() => {
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+
+  // ===== Utility =====
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const now = () => performance.now();
+
+  // ===== Resize: keep logical pixels sharp =====
+  function resize() {
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    canvas.width  = Math.floor(window.innerWidth * dpr);
+    canvas.height = Math.floor(window.innerHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS pixels
+  }
+  window.addEventListener("resize", resize, { passive: true });
+  resize();
+
+  // ===== Assets (enemy image) =====
+  const invaderImg = new Image();
+  let invaderImgReady = false;
+  invaderImg.onload = () => { invaderImgReady = true; };
+  invaderImg.onerror = () => { invaderImgReady = false; };
+  invaderImg.src = "invader.png"; // same folder as index.html
+
+  // ===== Game State =====
+  const state = {
+    running: true,
+    won: false,
+    lost: false,
+    score: 0,
+    wave: 1,
+  };
+
+  // ===== Player =====
+  const player = {
+    w: 44,
+    h: 18,
+    x: 0,
+    y: 0,
+    speed: 420, // px/s
+    cooldownMs: 140, // スマホ向けに少し爽快に
+    lastShotAt: -1e9,
+    alive: true,
+  };
+
+  // ===== Bullets =====
+  const bullets = [];      // player bullets
+  const enemyBullets = []; // enemy bullets
+  const bulletSpeed = 740;
+  const enemyBulletSpeed = 340;
+
+  // ===== Effects (explosions) =====
+  const explosions = []; // {x,y,life,ttl,parts:[{x,y,vx,vy,life,ttl}]}
+
+  function spawnExplosion(x, y) {
+    const ttl = 0.38; // seconds
+    const parts = [];
+    const n = 18;
+    for (let i = 0; i < n; i++) {
+      const a = (Math.PI * 2) * (i / n) + (Math.random() - 0.5) * 0.2;
+      const sp = 90 + Math.random() * 210;
+      parts.push({
+        x, y,
+        vx: Math.cos(a) * sp,
+        vy: Math.sin(a) * sp,
+        life: 0,
+        ttl: 0.25 + Math.random() * 0.25
+      });
+    }
+    explosions.push({ x, y, life: 0, ttl, parts });
+  }
+
+  // ===== Invaders =====
+  const invaders = [];
+  const inv = {
+    cols: 10,
+    rows: 5,
+    w: 28,
+    h: 20,
+    gapX: 14,
+    gapY: 12,
+    offsetX: 0,
+    offsetY: 70,
+    dir: 1,
+    speed: 55,       // base horizontal px/s
+    drop: 22,        // drop when hit wall
+    shootChance: 0.25 // per second (scaled)
+  };
+
+  // ===== Input (keyboard) =====
+  const keys = { left:false, right:false, shoot:false };
+
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "ArrowLeft" || e.code === "KeyA") keys.left = true;
+    if (e.code === "ArrowRight" || e.code === "KeyD") keys.right = true;
+    if (e.code === "Space" || e.code === "KeyZ") keys.shoot = true;
+    if (e.code === "Enter") {
+      if (!state.running) restart();
+    }
+  });
+
+  window.addEventListener("keyup", (e) => {
+    if (e.code === "ArrowLeft" || e.code === "KeyA") keys.left = false;
+    if (e.code === "ArrowRight" || e.code === "KeyD") keys.right = false;
+    if (e.code === "Space" || e.code === "KeyZ") keys.shoot = false;
+  });
+
+  // ===== Touch (スマホ特化) =====
+  // 下30%を左右に分割して移動、上側タップで発射
+  let touchMode = false;
+  let touchLeft = false, touchRight = false, touchShoot = false;
+
+  function resetTouch() {
+    touchLeft = false;
+    touchRight = false;
+    touchShoot = false;
+  }
+
+  function handleTouch(clientX, clientY, isDown) {
+    touchMode = true;
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    const x = clamp(clientX, 0, w);
+    const y = clamp(clientY, 0, h);
+
+    resetTouch();
+    if (!isDown) return;
+
+    const moveZoneTop = h * 0.70; // 下30%が移動ゾーン
+    const inMoveZone = y >= moveZoneTop;
+
+    if (inMoveZone) {
+      if (x < w * 0.5) touchLeft = true;
+      else touchRight = true;
+      // 移動中は誤爆しやすいので、発射は上側タップのみにしてる
+    } else {
+      touchShoot = true;
+    }
+  }
+
+  canvas.addEventListener("pointerdown", (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    handleTouch(e.clientX, e.clientY, true);
+  });
+
+  canvas.addEventListener("pointermove", (e) => {
+    handleTouch(e.clientX, e.clientY, e.buttons === 1);
+  });
+
+  canvas.addEventListener("pointerup", () => {
+    resetTouch();
+  });
+
+  // ===== Init / Restart =====
+  function spawnWave() {
+    invaders.length = 0;
+    inv.dir = 1;
+
+    const totalWidth = inv.cols * inv.w + (inv.cols - 1) * inv.gapX;
+    inv.offsetX = (window.innerWidth - totalWidth) / 2;
+
+    for (let r = 0; r < inv.rows; r++) {
+      for (let c = 0; c < inv.cols; c++) {
+        invaders.push({
+          x: inv.offsetX + c * (inv.w + inv.gapX),
+          y: inv.offsetY + r * (inv.h + inv.gapY),
+          w: inv.w,
+          h: inv.h,
+          alive: true,
+          type: r,
+        });
+      }
+    }
+  }
+
+  function resetPlayer() {
+    player.x = (window.innerWidth - player.w) / 2;
+    player.y = window.innerHeight - player.h - 48; // 指で隠れにくく少し上
+    player.alive = true;
+    player.lastShotAt = -1e9;
+  }
+
+  function restart() {
+    state.running = true;
+    state.won = false;
+    state.lost = false;
+    state.score = 0;
+    state.wave = 1;
+    bullets.length = 0;
+    enemyBullets.length = 0;
+    explosions.length = 0;
+    resetPlayer();
+    spawnWave();
+  }
+
+  restart();
+
+  // ===== Game Logic =====
+  function shootPlayer(t) {
+    if (t - player.lastShotAt < player.cooldownMs) return;
+    player.lastShotAt = t;
+    bullets.push({
+      x: player.x + player.w / 2 - 2,
+      y: player.y - 10,
+      w: 4,
+      h: 10,
+      vy: -bulletSpeed
+    });
+  }
+
+  function shootEnemy(from) {
+    enemyBullets.push({
+      x: from.x + from.w / 2 - 2,
+      y: from.y + from.h + 2,
+      w: 4,
+      h: 10,
+      vy: enemyBulletSpeed
+    });
+  }
+
+  function aabb(a, b) {
+    return a.x < b.x + b.w &&
+           a.x + a.w > b.x &&
+           a.y < b.y + b.h &&
+           a.y + a.h > b.y;
+  }
+
+  let last = now();
+
+  function step() {
+    const t = now();
+    const dt = Math.min(0.033, (t - last) / 1000);
+    last = t;
+
+    if (state.running) update(dt, t);
+    draw();
+
+    requestAnimationFrame(step);
+  }
+
+  function update(dt, tms) {
+    // ===== Input resolve =====
+    const left  = keys.left  || touchLeft;
+    const right = keys.right || touchRight;
+    const shoot = keys.shoot || touchShoot;
+
+    // ===== Player movement =====
+    let vx = 0;
+    if (left) vx -= player.speed;
+    if (right) vx += player.speed;
+    player.x = clamp(player.x + vx * dt, 10, window.innerWidth - player.w - 10);
+
+    // ===== Player shooting =====
+    if (shoot) shootPlayer(tms);
+
+    // ===== Move bullets =====
+    for (const b of bullets) b.y += b.vy * dt;
+    for (const b of enemyBullets) b.y += b.vy * dt;
+
+    // Remove offscreen bullets
+    for (let i = bullets.length - 1; i >= 0; i--) {
+      if (bullets[i].y + bullets[i].h < -20) bullets.splice(i, 1);
+    }
+    for (let i = enemyBullets.length - 1; i >= 0; i--) {
+      if (enemyBullets[i].y > window.innerHeight + 40) enemyBullets.splice(i, 1);
+    }
+
+    // ===== Explosions update =====
+    for (let i = explosions.length - 1; i >= 0; i--) {
+      const ex = explosions[i];
+      ex.life += dt;
+      for (const p of ex.parts) {
+        p.life += dt;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.vx *= (1 - 2.8 * dt); // drag
+        p.vy *= (1 - 2.8 * dt);
+      }
+      if (ex.life >= ex.ttl) explosions.splice(i, 1);
+    }
+
+    // ===== Move invaders as a group =====
+    const aliveInv = invaders.filter(v => v.alive);
+    if (aliveInv.length === 0) {
+      state.won = true;
+      state.running = false;
+      return;
+    }
+
+    // Speed up as fewer remain + wave
+    const remainRatio = aliveInv.length / (inv.cols * inv.rows);
+    const speedScale = (1 + (1 - remainRatio) * 1.7) * (1 + (state.wave - 1) * 0.12);
+    const vxInv = inv.speed * speedScale * inv.dir;
+
+    // Check bounds
+    let minX = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const v of aliveInv) {
+      minX = Math.min(minX, v.x);
+      maxX = Math.max(maxX, v.x + v.w);
+      maxY = Math.max(maxY, v.y + v.h);
+    }
+
+    const nextMinX = minX + vxInv * dt;
+    const nextMaxX = maxX + vxInv * dt;
+
+    const hitLeft = nextMinX < 10;
+    const hitRight = nextMaxX > window.innerWidth - 10;
+
+    if (hitLeft || hitRight) {
+      inv.dir *= -1;
+      for (const v of aliveInv) v.y += inv.drop;
+    } else {
+      for (const v of aliveInv) v.x += vxInv * dt;
+    }
+
+    // Lose condition: invaders reach player line
+    if (maxY >= player.y - 8) {
+      state.lost = true;
+      state.running = false;
+      return;
+    }
+
+    // ===== Enemy shooting (pick bottom-most per column) =====
+    const shootPerSec = inv.shootChance * (1 + (1 - remainRatio) * 2.2) * (1 + (state.wave - 1) * 0.15);
+    if (Math.random() < shootPerSec * dt) {
+      const col = Math.floor(Math.random() * inv.cols);
+      let shooter = null;
+      for (let r = inv.rows - 1; r >= 0; r--) {
+        const idx = r * inv.cols + col;
+        const v = invaders[idx];
+        if (v && v.alive) { shooter = v; break; }
+      }
+      if (shooter) shootEnemy(shooter);
+    }
+
+    // ===== Collisions: player bullets vs invaders =====
+    for (let bi = bullets.length - 1; bi >= 0; bi--) {
+      const b = bullets[bi];
+      let hitInv = null;
+
+      for (const v of invaders) {
+        if (!v.alive) continue;
+        if (aabb(b, v)) { hitInv = v; break; }
+      }
+
+      if (hitInv) {
+        hitInv.alive = false;
+        bullets.splice(bi, 1);
+        state.score += 10;
+
+        // Explosion at center of invader
+        spawnExplosion(hitInv.x + hitInv.w / 2, hitInv.y + hitInv.h / 2);
+      }
+    }
+
+    // ===== Collisions: enemy bullets vs player =====
+    for (let bi = enemyBullets.length - 1; bi >= 0; bi--) {
+      const b = enemyBullets[bi];
+      if (aabb(b, player)) {
+        spawnExplosion(player.x + player.w / 2, player.y + player.h / 2);
+        state.lost = true;
+        state.running = false;
+        break;
+      }
+    }
+
+    // タップ発射は「その瞬間」だけでいいので、毎フレーム解除（長押し連射はクールダウンで制御）
+    touchShoot = false;
+  }
+
+  // ===== Draw helpers =====
+  function drawInvaderFallback(v) {
+    ctx.strokeStyle = "#fff";
+    ctx.strokeRect(v.x, v.y, v.w, v.h);
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(v.x + 6, v.y + 6, 4, 4);
+    ctx.fillRect(v.x + v.w - 10, v.y + 6, 4, 4);
+    ctx.fillRect(v.x + 10, v.y + v.h - 6, v.w - 20, 3);
+  }
+
+  function drawExplosion(ex) {
+    const t = ex.life / ex.ttl; // 0..1
+    // ring
+    ctx.globalAlpha = 0.35 * (1 - t);
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(ex.x, ex.y, 8 + t * 26, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // particles
+    for (const p of ex.parts) {
+      const pt = p.life / p.ttl;
+      if (pt >= 1) continue;
+      ctx.globalAlpha = 0.9 * (1 - pt);
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(p.x, p.y, 2, 2);
+    }
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = 1;
+  }
+
+  // ===== Draw =====
+  function draw() {
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+
+    // Clear
+    ctx.clearRect(0, 0, W, H);
+
+    // Background
+    ctx.globalAlpha = 0.95;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+
+    // Stars
+    ctx.globalAlpha = 0.18;
+    ctx.fillStyle = "#fff";
+    for (let i = 0; i < 40; i++) {
+      const x = (i * 97) % W;
+      const y = (i * 173) % H;
+      ctx.fillRect(x, y, 1, 1);
+    }
+    ctx.globalAlpha = 1;
+
+    // HUD
+    ctx.fillStyle = "#fff";
+    ctx.font = "16px sans-serif";
+    ctx.fillText(`SCORE ${state.score}`, 12, 24);
+
+    // 操作ガイド（スマホ優先）
+    ctx.globalAlpha = 0.75;
+    ctx.font = "12px sans-serif";
+    if (touchMode) {
+      ctx.fillText(`下の左右：移動  /  上をタップ：発射`, 12, H - 12);
+    } else {
+      ctx.fillText(`←→ / A D : 移動   SPACE / Z : 発射   ENTER : リスタート`, 12, H - 12);
+    }
+    ctx.globalAlpha = 1;
+
+    // Player
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(player.x, player.y, player.w, player.h);
+    ctx.fillRect(player.x + player.w/2 - 5, player.y - 6, 10, 6);
+
+    // Bullets
+    ctx.fillStyle = "#fff";
+    for (const b of bullets) ctx.fillRect(b.x, b.y, b.w, b.h);
+
+    ctx.globalAlpha = 0.9;
+    for (const b of enemyBullets) ctx.fillRect(b.x, b.y, b.w, b.h);
+    ctx.globalAlpha = 1;
+
+    // Invaders (image if ready, else fallback)
+    for (const v of invaders) {
+      if (!v.alive) continue;
+      if (invaderImgReady) ctx.drawImage(invaderImg, v.x, v.y, v.w, v.h);
+      else drawInvaderFallback(v);
+    }
+
+    // Explosions
+    for (const ex of explosions) drawExplosion(ex);
+
+    // Touch hint overlay (zone guides)
+    if (touchMode && state.running) {
+      ctx.globalAlpha = 0.18;
+      ctx.strokeStyle = "#fff";
+      ctx.beginPath();
+      ctx.moveTo(W/2, H*0.70); ctx.lineTo(W/2, H);
+      ctx.moveTo(0, H*0.70); ctx.lineTo(W, H*0.70);
+      ctx.stroke();
+
+      ctx.fillStyle = "#fff";
+      ctx.globalAlpha = 0.22;
+      ctx.font = "18px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("◀︎", W*0.25, H*0.86);
+      ctx.fillText("▶︎", W*0.75, H*0.86);
+      ctx.textAlign = "left";
+      ctx.globalAlpha = 1;
+    }
+
+    // End screen
+    if (!state.running) {
+      ctx.fillStyle = "rgba(0,0,0,0.65)";
+      ctx.fillRect(0, 0, W, H);
+
+      ctx.fillStyle = "#fff";
+      ctx.textAlign = "center";
+      ctx.font = "28px sans-serif";
+      ctx.fillText(state.won ? "CLEAR!" : "GAME OVER", W / 2, H / 2 - 20);
+
+      ctx.font = "16px sans-serif";
+      ctx.fillText(`ENTER でリスタート`, W / 2, H / 2 + 18);
+
+      ctx.textAlign = "left";
+    }
+  }
+
+  requestAnimationFrame(step);
+})();
+</script>
+</body>
+</html>
