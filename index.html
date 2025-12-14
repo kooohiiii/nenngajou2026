@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>馬インベーダー</title>
+  <style>
+    html, body { margin:0; height:100%; background:#000; overflow:hidden; }
+    canvas { display:block; width:100vw; height:100vh; touch-action:none; }
+
+    #restartBtn {
+      position: fixed;
+      left: 50%;
+      top: 60%;
+      transform: translate(-50%, -50%);
+      padding: 14px 18px;
+      font-size: 16px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.75);
+      background: rgba(0,0,0,0.78);
+      color: #fff;
+      display: none;
+      z-index: 10;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<button id="restartBtn">やりなおす</button>
+
+<script>
+(() => {
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const restartBtn = document.getElementById("restartBtn");
+
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+  const now = ()=>performance.now();
+
+  function resize(){
+    const dpr=Math.min(2,window.devicePixelRatio||1);
+    canvas.width=window.innerWidth*dpr;
+    canvas.height=window.innerHeight*dpr;
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  window.addEventListener("resize",()=>{resize();applyTuning();});
+  resize();
+
+  const stages=[
+    {name:"STAGE 1",src:"horse1.png"},
+    {name:"STAGE 2",src:"horse2.png"},
+    {name:"BOSS",src:"phoenix.png"}
+  ];
+
+  const imgs=[];
+  stages.forEach((s,i)=>{
+    const im=new Image();
+    im.src=s.src;
+    imgs[i]=im;
+  });
+
+  const state={running:true,won:false,stage:0};
+
+  const player={x:0,y:0,w:60,h:24,speed:500,cd:125,last:-1e9};
+  const bullets=[];
+  const enemyBullets=[];
+  const enemies=[];
+
+  let bulletSpeed=800;
+  let enemyBulletSpeed=320;
+  let baseShootChance=0.14;
+
+  const inv={
+    cols:6,rows:4,
+    w:64,h:48,gx:18,gy:16,
+    dir:1,speed:52
+  };
+
+  function applyTuning(){
+    const W=innerWidth,H=innerHeight;
+    inv.w=clamp(W*0.13,54,92);
+    inv.h=inv.w*0.78;
+    inv.gx=clamp(inv.w*0.35,14,28);
+    inv.gy=clamp(inv.h*0.32,10,24);
+
+    player.w=clamp(W*0.15,48,74);
+    player.h=player.w*0.4;
+    player.speed=clamp(W*1.1,360,760);
+
+    bulletSpeed=clamp(H*1.15,620,920);
+    enemyBulletSpeed=clamp(H*0.6,260,520);
+
+    inv.speed=clamp(W*0.1,30,72);
+    baseShootChance=clamp(0.1+(Math.min(W,H)/900)*0.08,0.1,0.2);
+  }
+
+  function spawnFormation(){
+    enemies.length=0;
+    const total=inv.cols*inv.w+(inv.cols-1)*inv.gx;
+    const ox=(innerWidth-total)/2;
+    const oy=clamp(innerHeight*0.14,70,130);
+
+    for(let r=0;r<inv.rows;r++){
+      for(let c=0;c<inv.cols;c++){
+        enemies.push({
+          x:ox+c*(inv.w+inv.gx),
+          y:oy+r*(inv.h+inv.gy),
+          w:inv.w,h:inv.h,
+          alive:true,
+          row:r,col:c,
+          // ★ ステージ2：先頭5体（row0の左5）だけ固定
+          frozen:(state.stage===1 && r===0 && c<5)
+        });
+      }
+    }
+  }
+
+  function restart(){
+    bullets.length=0;
+    enemyBullets.length=0;
+    state.running=true;
+    state.won=false;
+    player.x=(innerWidth-player.w)/2;
+    player.y=innerHeight-player.h-50;
+    player.last=-1e9;
+    spawnFormation();
+    restartBtn.style.display="none";
+  }
+
+  restartBtn.onclick=()=>{
+    if(state.won){
+      state.stage=(state.stage+1)%stages.length;
+    }
+    restart();
+  };
+
+  window.addEventListener("keydown",e=>{
+    if(e.code==="ArrowLeft") player.vx=-1;
+    if(e.code==="ArrowRight") player.vx=1;
+    if(e.code==="Space") shoot(now());
+  });
+  window.addEventListener("keyup",()=>player.vx=0);
+
+  function shoot(t){
+    if(t-player.last<player.cd) return;
+    player.last=t;
+    bullets.push({x:player.x+player.w/2-2,y:player.y,w:4,h:10,vy:-bulletSpeed});
+  }
+
+  function shootEnemy(e){
+    enemyBullets.push({
+      x:e.x+e.w/2-2,
+      y:e.y+e.h+2,
+      w:4,h:10,
+      vy:enemyBulletSpeed
+    });
+  }
+
+  function update(dt){
+    player.x+=player.vx*player.speed*dt;
+    player.x=clamp(player.x,10,innerWidth-player.w-10);
+
+    bullets.forEach(b=>b.y+=b.vy*dt);
+    enemyBullets.forEach(b=>b.y+=b.vy*dt);
+
+    bullets.forEach((b,bi)=>{
+      enemies.forEach(e=>{
+        if(e.alive &&
+          b.x<b.x+b.w &&
+          b.x+ b.w>e.x &&
+          b.y<e.y+e.h &&
+          b.y+b.h>e.y){
+          e.alive=false;
+          bullets.splice(bi,1);
+        }
+      });
+    });
+
+    // ★ ステージ別発射頻度
+    let stageChance=
+      state.stage===0 ? baseShootChance*1.9 :
+      state.stage===1 ? baseShootChance*0.75 :
+                        baseShootChance*3.2;
+
+    if(Math.random()<stageChance*dt){
+      const shooters=enemies.filter(e=>e.alive);
+      if(shooters.length){
+        shootEnemy(shooters[Math.floor(Math.random()*shooters.length)]);
+      }
+    }
+
+    // 横移動（★ frozenは動かさない）
+    let minX=Infinity,maxX=-Infinity;
+    enemies.forEach(e=>{
+      if(!e.alive||e.frozen) return;
+      minX=Math.min(minX,e.x);
+      maxX=Math.max(maxX,e.x+e.w);
+    });
+
+    const vx=inv.speed*inv.dir;
+    if(minX+vx*dt<10||maxX+vx*dt>innerWidth-10){
+      inv.dir*=-1;
+    }else{
+      enemies.forEach(e=>{
+        if(e.alive&&!e.frozen){
+          e.x+=vx*dt;
+        }
+      });
+    }
+
+    if(enemies.every(e=>!e.alive)){
+      state.running=false;
+      state.won=true;
+      restartBtn.style.display="block";
+    }
+  }
+
+  function draw(){
+    ctx.clearRect(0,0,innerWidth,innerHeight);
+    ctx.fillStyle="#000";
+    ctx.fillRect(0,0,innerWidth,innerHeight);
+
+    ctx.fillStyle="#fff";
+    ctx.fillRect(player.x,player.y,player.w,player.h);
+
+    bullets.forEach(b=>ctx.fillRect(b.x,b.y,b.w,b.h));
+    enemyBullets.forEach(b=>ctx.fillRect(b.x,b.y,b.w,b.h));
+
+    const img=imgs[state.stage];
+    enemies.forEach(e=>{
+      if(!e.alive) return;
+      if(img.complete){
+        ctx.drawImage(img,e.x,e.y,e.w,e.h);
+      }else{
+        ctx.strokeRect(e.x,e.y,e.w,e.h);
+      }
+    });
+
+    if(!state.running){
+      ctx.fillStyle="rgba(0,0,0,0.6)";
+      ctx.fillRect(0,0,innerWidth,innerHeight);
+      ctx.fillStyle="#fff";
+      ctx.font="24px sans-serif";
+      ctx.textAlign="center";
+      ctx.fillText(state.won?"CLEAR":"GAME OVER",innerWidth/2,innerHeight/2);
+    }
+  }
+
+  let last=now();
+  function loop(){
+    const t=now();
+    const dt=Math.min(0.033,(t-last)/1000);
+    last=t;
+    if(state.running) update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  applyTuning();
+  restart();
+  loop();
+})();
+</script>
+</body>
+</html>
