@@ -898,7 +898,7 @@
         if (m.y < top){ m.y=top; m.vy *= -1; }
         if (m.y + m.h > bottom){ m.y = bottom - m.h; m.vy *= -1; }
 
-        const shootPerSec = baseShootChance * 5.0;
+        const shootPerSec = baseShootChance * 4.0;
         if (Math.random() < shootPerSec*dt){
           if (m.role === "homing") {
             shootEnemy(m, { type:"homing", color:"#3b7bff", vy: enemyBulletSpeed*0.70, vx: rand(-20,20), homing: 1.35 });
