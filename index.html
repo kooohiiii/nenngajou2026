@@ -1019,7 +1019,7 @@
     if (b.y + b.h > areaBottom){ b.y = areaBottom - b.h; b.vy *= -1; }
 
     const hpRatio = b.hp / b.maxHp;
-    const shootPerSec = baseShootChance * 7.7 * (1 + (1-hpRatio)*0.7);
+    const shootPerSec = baseShootChance * 6.2 * (1 + (1-hpRatio)*0.7);
 
     if (Math.random() < shootPerSec*dt){
       const pattern = (Math.random() < 0.55) ? 2 : 3;
