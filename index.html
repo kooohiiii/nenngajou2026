@@ -898,7 +898,7 @@
         if (m.y < top){ m.y=top; m.vy *= -1; }
         if (m.y + m.h > bottom){ m.y = bottom - m.h; m.vy *= -1; }
 
-        const shootPerSec = baseShootChance * 2.0;
+        const shootPerSec = baseShootChance * 3.0;
         if (Math.random() < shootPerSec*dt){
           if (m.role === "homing") {
             shootEnemy(m, { type:"homing", color:"#3b7bff", vy: enemyBulletSpeed*0.70, vx: rand(-20,20), homing: 1.35 });
@@ -959,7 +959,7 @@
       const redVy   = enemyBulletSpeed * 0.62;
       const blueVy  = enemyBulletSpeed * 0.54;
 
-      const shootPerSec = baseShootChance * 3.05 * anger;
+      const shootPerSec = baseShootChance * 3.5 * anger;
       if (Math.random() < shootPerSec*dt){
         let pattern=1;
         if (hpRatio>=0.666) pattern=1;
@@ -1019,7 +1019,7 @@
     if (b.y + b.h > areaBottom){ b.y = areaBottom - b.h; b.vy *= -1; }
 
     const hpRatio = b.hp / b.maxHp;
-    const shootPerSec = baseShootChance * 3.10 * (1 + (1-hpRatio)*0.7);
+    const shootPerSec = baseShootChance * 3.50 * (1 + (1-hpRatio)*0.7);
 
     if (Math.random() < shootPerSec*dt){
       const pattern = (Math.random() < 0.55) ? 2 : 3;
